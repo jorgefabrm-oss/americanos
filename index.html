@@ -334,9 +334,7 @@ function gamesEach(t, R){ return R * slotsPerRound(t) / entities(t).length; }
 function defaultRounds(t){
   const n = entities(t).length;
   if(t.mode !== 'individual') return Math.ceil(n * (n - 1) / 2 / effCourts(t));
-  const st = equalStep(t), target = n - 1;
-  const lo = Math.max(st, Math.floor(target / st) * st), hi = Math.ceil(target / st) * st;
-  return (target - lo) <= (hi - target) ? lo : hi;
+  return everyoneRounds(n, effCourts(t));
 }
 function plannedCounts(t){
   const c = {}; entities(t).forEach(e => c[e.id] = 0);
@@ -346,44 +344,84 @@ function plannedCounts(t){
 function roundsToEqualize(t){
   const st = equalStep(t), R = t.rounds.length; return (st - R % st) % st;
 }
-/* Todos contra todos llenando todas las canchas en cada ronda */
-function packRoundRobin(ids, courts){
-  const all = [];
-  for(let i = 0; i < ids.length; i++) for(let j = i + 1; j < ids.length; j++) all.push([ids[i], ids[j]]);
+/* Empaqueta "items" (pares de ids) en rondas sin repetir jugador, llenando hasta perRound por ronda */
+function packItems(ids, items, perRound, even, tries){
   let best = null, bestScore = Infinity;
-  for(let t = 0; t < 60; t++){
-    let pool = shuffle(all.slice());
+  for(let t = 0; t < (tries || 60); t++){
+    let pool = shuffle(items.slice());
     const played = {}, last = {}; ids.forEach(i => { played[i] = 0; last[i] = -1; });
-    const rounds = []; let unfair = 0;
+    const rounds = []; let unfair = 0, stuck = false;
     while(pool.length){
       const pr = m => (played[m[0]] + played[m[1]]) * 10 + (last[m[0]] + last[m[1]]);
       let pick = null, pickScore = Infinity;
       for(let k = 0; k < 40; k++){
-        const order = pool.map(m => [m, pr(m) + (k ? Math.random() * 12 : 0)]).sort((a, b) => a[1] - b[1]).map(x => x[0]);
+        const order = pool.map(m => [m, pr(m) + (k ? Math.random() * 12 : 0)]).sort((x, y) => x[1] - y[1]).map(x => x[0]);
         const busy = new Set(), ch = [];
-        for(const m of order){ if(ch.length >= courts) break; if(!busy.has(m[0]) && !busy.has(m[1])){ ch.push(m); busy.add(m[0]); busy.add(m[1]); } }
-        const sc = -ch.length * 10000 + ch.reduce((a, m) => a + pr(m), 0);
+        for(const m of order){ if(ch.length >= perRound) break; if(!busy.has(m[0]) && !busy.has(m[1])){ ch.push(m); busy.add(m[0]); busy.add(m[1]); } }
+        if(even && ch.length % 2) ch.pop();
+        if(!ch.length) continue;
+        const sc = -ch.length * 10000 + ch.reduce((acc, m) => acc + pr(m), 0);
         if(sc < pickScore){ pickScore = sc; pick = ch; }
       }
+      if(!pick){ stuck = true; break; }
       const r = rounds.length; const set = new Set(pick);
       pick.forEach(m => { played[m[0]]++; played[m[1]]++; last[m[0]] = r; last[m[1]] = r; });
       pool = pool.filter(m => !set.has(m));
       const pv = Object.values(played); unfair += Math.max(...pv) - Math.min(...pv);
       rounds.push(pick);
     }
+    if(stuck) continue;
     const score = rounds.length * 100000 + unfair;
     if(score < bestScore){ bestScore = score; best = rounds; }
   }
+  return best;
+}
+function allPairs(ids){ const out = []; for(let i = 0; i < ids.length; i++) for(let j = i + 1; j < ids.length; j++) out.push([ids[i], ids[j]]); return out; }
+/* Parejas fijas: todos contra todos llenando todas las canchas */
+function packRoundRobin(ids, courts){
+  const best = packItems(ids, allPairs(ids), courts, false, 60);
   return best.map(ms => {
     const pl = new Set(ms.flat());
     return { matches: ms.map((m, j) => ({ id: uid(), court: j + 1, a: [m[0]], b: [m[1]], sa: null, sb: null })), rest: ids.filter(x => !pl.has(x)) };
   });
 }
+/* Individual: cada jugador es compañero de TODOS los demás, y todos juegan la misma cantidad */
+function partnerExtras(ids){
+  const n = ids.length, total = n * (n - 1) / 2; if(total % 2 === 0) return [];
+  const sh = shuffle(ids.slice()), ex = [];
+  if(n % 2 === 0) for(let i = 0; i < n; i += 2) ex.push([sh[i], sh[i + 1]]);
+  else for(let i = 0; i < n; i++) ex.push([sh[i], sh[(i + 1) % n]]);
+  return ex;
+}
+function everyoneSchedule(ids, courts){
+  const k = Math.min(courts, Math.floor(ids.length / 4));
+  let packed = null;
+  for(let a = 0; a < 6 && !packed; a++) packed = packItems(ids, allPairs(ids).concat(partnerExtras(ids)), 2 * k, true, ids.length > 16 ? 25 : 50);
+  if(!packed) return null;
+  const opp = {};
+  return packed.map(prs => {
+    let best = null, bc = Infinity;
+    for(let t = 0; t < 300; t++){
+      const p = shuffle(prs.slice()); let c = 0; const ms = [];
+      for(let i = 0; i < p.length; i += 2){ const A = p[i], B = p[i + 1]; A.forEach(x => B.forEach(y => c += Math.pow(opp[pk(x, y)] || 0, 2))); ms.push([A, B]); }
+      if(c < bc){ bc = c; best = ms; if(c === 0) break; }
+    }
+    best.forEach(([A, B]) => A.forEach(x => B.forEach(y => { const kk = pk(x, y); opp[kk] = (opp[kk] || 0) + 1; })));
+    const pl = new Set(prs.flat());
+    return { matches: best.map(([A, B], j) => ({ id: uid(), court: j + 1, a: A.slice(), b: B.slice(), sa: null, sb: null })), rest: ids.filter(x => !pl.has(x)) };
+  });
+}
+function everyoneRounds(n, courts){
+  const k = Math.min(courts, Math.floor(n / 4)); let P = n * (n - 1) / 2;
+  if(P % 2) P += n % 2 === 0 ? n / 2 : n;
+  return Math.ceil(P / (2 * k));
+}
 function generate(t){
   const ids = entities(t).map(e => e.id); const c = effCourts(t);
   const R = t.roundsWanted || defaultRounds(t);
   if(t.mode === 'individual'){
-    t.rounds = greedySchedule(ids, c, R, [], 2, 30);
+    const ev = !t.roundsWanted ? everyoneSchedule(ids, c) : null;
+    t.rounds = ev || greedySchedule(ids, c, R, [], 2, 30);
   } else {
     let rr = packRoundRobin(ids, c).slice(0, R);
     if(rr.length < R) rr = rr.concat(greedySchedule(ids, c, R - rr.length, rr, 1, 10));
@@ -614,6 +652,12 @@ function renderMatch(t, m){
 }
 
 
+function autoText(t){
+  const n = entities(t).length;
+  if(t.mode !== 'individual') return `<span style="color:var(--lima);font-weight:700">Automático: todas las parejas juegan contra todas</span> (${n - 1} partidos c/u).`;
+  let P = n * (n - 1) / 2; if(P % 2) P += n % 2 === 0 ? n / 2 : n;
+  return `<span style="color:var(--lima);font-weight:700">Automático: cada uno es compañero de todos</span> · ${everyoneRounds(n, effCourts(t))} rondas · ${2 * P / n} partidos c/u, todos iguales.`;
+}
 function roundsCourts(t){ return t.rounds.length ? Math.max(...t.rounds.map(r => r.matches.length)) : effCourts(t); }
 /* ===== igualdad de partidos ===== */
 function equalInfo(t){
@@ -723,7 +767,7 @@ function renderSettings(t){
     <div class="grid2"><div class="fld"><label class="f">Fecha</label><input type="date" data-set="date" value="${esc(t.date)}"></div>
     <div class="fld"><label class="f">Canchas</label><input type="number" min="1" data-set="courts" value="${t.courts}">${t.courts > maxCourts(t) ? `<div class="hint" style="color:var(--nar);font-weight:700">Con ${entities(t).length} ${t.mode === 'individual' ? 'jugadores' : 'parejas'} solo se usan ${maxCourts(t)}.</div>` : ''}</div></div>
     ${roundsCourts(t) !== effCourts(t) ? `<div class="warn" style="margin-top:4px"><b>Las rondas no usan ${effCourts(t)} canchas</b><div>Las rondas actuales se armaron con ${roundsCourts(t)} cancha(s).</div><div class="bar2" style="margin-top:10px">${allMatches(t).some(done) ? '<button class="btn lima sm" data-act="addround">Agregar ronda con las canchas nuevas</button>' : '<button class="btn lima sm" data-act="resort">Sortear de nuevo con ' + effCourts(t) + ' canchas</button>'}</div></div>` : ''}
-    <div class="fld" style="margin-bottom:0"><label class="f">Rondas al sortear</label><input type="number" min="1" data-set="roundsWanted" value="${t.roundsWanted || ''}" placeholder="Automático (${defaultRounds(t)})"><div class="hint">${roundsHint(t)}</div></div>
+    <div class="fld" style="margin-bottom:0"><label class="f">Rondas al sortear</label><input type="number" min="1" data-set="roundsWanted" value="${t.roundsWanted || ''}" placeholder="Automático (${defaultRounds(t)})"><div class="hint">${t.roundsWanted ? roundsHint(t) : autoText(t)}<br>Déjalo vacío para que todos jueguen con todos. Si pones un número, la noche es más corta pero no todos se cruzan.</div></div>
   </div>
   <div class="sec-t">Marcador</div>
   <div class="card"><div class="seg" style="margin-bottom:14px"><label><input type="radio" name="st" data-set="stype" value="fixed" ${fx ? 'checked' : ''}>Suma fija</label><label><input type="radio" name="st" data-set="stype" value="free" ${!fx ? 'checked' : ''}>Libre</label></div>
@@ -903,7 +947,7 @@ function wireNew(){
       const R = parseInt(f.rounds.value);
       let txt = roundsHint(tmp);
       if(R && !Number.isInteger(gamesEach(tmp, R))) txt = '<span style="color:var(--rojo);font-weight:700">Con ' + R + ' rondas no todos juegan lo mismo.</span> ' + txt;
-      $('#rhint').innerHTML = pairs && !R ? 'Automático: todos contra todos, todas juegan lo mismo.' : txt;
+      $('#rhint').innerHTML = !R ? autoText(tmp) : txt;
     } else { $('#rhint').innerHTML = ''; $('#chint').innerHTML = ''; $('#rinp').placeholder = 'Automático'; }
     const T = parseInt(f.total.value) || 4;
     $('#shint').textContent = f.stype.value === 'fixed' ? `Cada partido suma ${T}: por ejemplo ${T}-0, ${T - 1}-1${T % 2 === 0 ? ', ' + T / 2 + '-' + T / 2 : ''}.` : 'Pones el marcador que haya quedado.';
